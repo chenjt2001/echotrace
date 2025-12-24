@@ -129,6 +129,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
   // 群聊成员姓名缓存（username -> displayName）
   Map<String, String> _senderDisplayNames = {};
   final Set<String> _messageKeys = {};
+  final Map<String, GlobalKey> _messageGlobalKeys = {};
   late AnimationController _refreshController;
   DateTime? _lastInitialLoadTime;
   bool _prefetchScheduled = false;
@@ -160,9 +161,24 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
   bool _isLoadingSessionDetail = false;
   String? _sessionDetailError;
   String? _sessionDetailForSession;
+  DateTime? _jumpTargetDate;
+  bool _isJumpingToDate = false;
   final ImageDecryptService _imageDecryptService = ImageDecryptService();
   final Map<String, List<String>> _datPathCache = {};
   String? _imageDisplayNameForPath;
+  Set<String> _availableMessageDates = {};
+  List<DateTime> _availableMessageDateList = [];
+  DateTime? _availableStartDate;
+  DateTime? _availableEndDate;
+  bool _isLoadingMessageDates = false;
+  String? _availableDatesSessionId;
+  bool _isJumpContextMode = false;
+  DateTime? _jumpWindowStartDate;
+  DateTime? _jumpWindowEndDate;
+  bool _canLoadOlderJump = false;
+  bool _canLoadNewerJump = false;
+  bool _isLoadingJumpOlder = false;
+  bool _isLoadingJumpNewer = false;
 
   // 搜索相关
   bool _isSearching = false;
@@ -313,6 +329,21 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
     _sessionDetailForSession = null;
     _datPathCache.clear();
     _imageDisplayNameForPath = null;
+    _jumpTargetDate = null;
+    _isJumpingToDate = false;
+    _availableMessageDates = {};
+    _availableMessageDateList = [];
+    _availableStartDate = null;
+    _availableEndDate = null;
+    _isLoadingMessageDates = false;
+    _availableDatesSessionId = null;
+    _isJumpContextMode = false;
+    _jumpWindowStartDate = null;
+    _jumpWindowEndDate = null;
+    _canLoadOlderJump = false;
+    _canLoadNewerJump = false;
+    _isLoadingJumpOlder = false;
+    _isLoadingJumpNewer = false;
   }
 
   DateTime? _getEarliestMessageDate() {
@@ -465,6 +496,626 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
         );
       },
     );
+  }
+
+  Future<void> _pickJumpDate() async {
+    await _loadAvailableMessageDates();
+    if (!mounted) return;
+    if (_availableMessageDates.isEmpty) {
+      _toast.show(context, '该会话暂无可跳转的消息日期', success: false);
+      return;
+    }
+
+    final picked = await _showJumpDatePickerDialog();
+    if (!mounted || picked == null) return;
+    setState(() {
+      _jumpTargetDate = picked;
+    });
+  }
+
+  Future<void> _loadAvailableMessageDates({bool force = false}) async {
+    final session = _selectedSession;
+    if (session == null || _isLoadingMessageDates) return;
+    if (!force &&
+        _availableDatesSessionId == session.username &&
+        _availableMessageDates.isNotEmpty) {
+      return;
+    }
+
+    setState(() {
+      _isLoadingMessageDates = true;
+    });
+
+    try {
+      final dates = await context
+          .read<AppState>()
+          .databaseService
+          .getSessionMessageDates(session.username);
+      if (!mounted || _selectedSession?.username != session.username) {
+        return;
+      }
+
+      dates.sort((a, b) => a.compareTo(b));
+      final normalizedDates = dates
+          .map((d) => DateTime(d.year, d.month, d.day))
+          .toList();
+      final keys = normalizedDates.map(_formatDateOnly).toSet();
+      setState(() {
+        _availableMessageDates = keys;
+        _availableMessageDateList = normalizedDates;
+        _availableStartDate = normalizedDates.isEmpty ? null : normalizedDates.first;
+        _availableEndDate = normalizedDates.isEmpty ? null : normalizedDates.last;
+        _availableDatesSessionId = session.username;
+      });
+    } finally {
+      if (mounted && _selectedSession?.username == session.username) {
+        setState(() {
+          _isLoadingMessageDates = false;
+        });
+      }
+    }
+  }
+
+  DateTime _normalizeDate(DateTime date) {
+    return DateTime(date.year, date.month, date.day);
+  }
+
+  int _findInsertIndex(DateTime date) {
+    final target = _normalizeDate(date);
+    for (int i = 0; i < _availableMessageDateList.length; i++) {
+      if (!_availableMessageDateList[i].isBefore(target)) {
+        return i;
+      }
+    }
+    return _availableMessageDateList.length;
+  }
+
+  DateTime? _findPreviousAvailableDate(DateTime date) {
+    if (_availableMessageDateList.isEmpty) return null;
+    final index = _findInsertIndex(date);
+    if (index <= 0) return null;
+    return _availableMessageDateList[index - 1];
+  }
+
+  DateTime? _findNextAvailableDate(DateTime date) {
+    if (_availableMessageDateList.isEmpty) return null;
+    final index = _findInsertIndex(date);
+    if (index >= _availableMessageDateList.length) return null;
+    if (_availableMessageDateList[index].isAtSameMomentAs(_normalizeDate(date))) {
+      return index + 1 < _availableMessageDateList.length
+          ? _availableMessageDateList[index + 1]
+          : null;
+    }
+    return _availableMessageDateList[index];
+  }
+
+  void _updateJumpRangeFlags() {
+    final start = _jumpWindowStartDate;
+    final end = _jumpWindowEndDate;
+    if (start == null || end == null) {
+      _canLoadOlderJump = false;
+      _canLoadNewerJump = false;
+      return;
+    }
+    _canLoadOlderJump = _findPreviousAvailableDate(start) != null;
+    _canLoadNewerJump = _findNextAvailableDate(end) != null;
+  }
+
+  Future<void> _loadJumpContextForDate(DateTime targetDate) async {
+    final session = _selectedSession;
+    if (session == null) return;
+
+    await _loadAvailableMessageDates();
+    if (!mounted || _selectedSession?.username != session.username) return;
+
+    final normalizedTarget = _normalizeDate(targetDate);
+    final datesToLoad = <DateTime>[];
+    final prevDate = _findPreviousAvailableDate(normalizedTarget);
+    final nextDate = _findNextAvailableDate(normalizedTarget);
+    if (prevDate != null) datesToLoad.add(prevDate);
+    datesToLoad.add(normalizedTarget);
+    if (nextDate != null) datesToLoad.add(nextDate);
+
+    setState(() {
+      _isLoadingMessages = true;
+      _isJumpContextMode = true;
+    });
+
+    try {
+      final dbService = context.read<AppState>().databaseService;
+      final List<Message> gathered = [];
+      for (final date in datesToLoad) {
+        final start = DateTime(date.year, date.month, date.day);
+        final end = start.add(const Duration(days: 1));
+        final startSec = start.millisecondsSinceEpoch ~/ 1000;
+        final endSec = end.millisecondsSinceEpoch ~/ 1000 - 1;
+        final messages = await dbService.getMessagesByDate(
+          session.username,
+          startSec,
+          endSec,
+        );
+        gathered.addAll(messages);
+      }
+
+      if (!mounted || _selectedSession?.username != session.username) return;
+      gathered.sort((a, b) {
+        if (a.createTime != b.createTime) {
+          return a.createTime.compareTo(b.createTime);
+        }
+        return a.localId.compareTo(b.localId);
+      });
+
+      setState(() {
+        _messages = gathered;
+        _messageKeys
+          ..clear()
+          ..addAll(_messages.map(_buildMessageKey));
+        _messageGlobalKeys.clear();
+        _currentOffset = _messages.length;
+        _hasMoreMessages = true;
+        _jumpWindowStartDate = datesToLoad.isEmpty ? null : datesToLoad.first;
+        _jumpWindowEndDate = datesToLoad.isEmpty ? null : datesToLoad.last;
+        _updateJumpRangeFlags();
+      });
+
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted ||
+            _selectedSession?.username != session.username ||
+            _messages.isEmpty) {
+          return;
+        }
+        final index = _messages.indexWhere((m) {
+          final msgDate = DateTime.fromMillisecondsSinceEpoch(
+            m.createTime * 1000,
+          );
+          return _formatDateOnly(msgDate) == _formatDateOnly(normalizedTarget);
+        });
+        if (index == -1) return;
+        final message = _messages[index];
+        final key = _messageGlobalKeys[_buildMessageKey(message)];
+        if (key?.currentContext != null) {
+          Scrollable.ensureVisible(
+            key!.currentContext!,
+            duration: const Duration(milliseconds: 260),
+            curve: Curves.easeOut,
+            alignment: 0.2,
+          );
+        }
+      });
+    } finally {
+      if (mounted && _selectedSession?.username == session.username) {
+        setState(() {
+          _isLoadingMessages = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _loadJumpAdjacentDate({required bool newer}) async {
+    if (!_isJumpContextMode) return;
+    if (newer && (_isLoadingJumpNewer || !_canLoadNewerJump)) return;
+    if (!newer && (_isLoadingJumpOlder || !_canLoadOlderJump)) return;
+
+    final session = _selectedSession;
+    final anchor = newer ? _jumpWindowEndDate : _jumpWindowStartDate;
+    if (session == null || anchor == null) return;
+
+    final targetDate =
+        newer ? _findNextAvailableDate(anchor) : _findPreviousAvailableDate(anchor);
+    if (targetDate == null) {
+      setState(() {
+        if (newer) {
+          _canLoadNewerJump = false;
+        } else {
+          _canLoadOlderJump = false;
+        }
+      });
+      return;
+    }
+
+    setState(() {
+      if (newer) {
+        _isLoadingJumpNewer = true;
+      } else {
+        _isLoadingJumpOlder = true;
+      }
+    });
+
+    try {
+      final dbService = context.read<AppState>().databaseService;
+      final start = DateTime(targetDate.year, targetDate.month, targetDate.day);
+      final end = start.add(const Duration(days: 1));
+      final startSec = start.millisecondsSinceEpoch ~/ 1000;
+      final endSec = end.millisecondsSinceEpoch ~/ 1000 - 1;
+      final messages = await dbService.getMessagesByDate(
+        session.username,
+        startSec,
+        endSec,
+      );
+      if (!mounted || _selectedSession?.username != session.username) return;
+
+      final sorted = messages
+        ..sort((a, b) {
+          if (a.createTime != b.createTime) {
+            return a.createTime.compareTo(b.createTime);
+          }
+          return a.localId.compareTo(b.localId);
+        });
+
+      if (sorted.isEmpty) {
+        setState(() {
+          if (newer) {
+            _canLoadNewerJump = false;
+          } else {
+            _canLoadOlderJump = false;
+          }
+        });
+        return;
+      }
+
+      if (newer) {
+        setState(() {
+          for (final msg in sorted) {
+            final key = _buildMessageKey(msg);
+            if (_messageKeys.add(key)) {
+              _messages.add(msg);
+            }
+          }
+          _jumpWindowEndDate = targetDate;
+          _updateJumpRangeFlags();
+        });
+      } else {
+        final oldPixels = _scrollController.hasClients
+            ? _scrollController.position.pixels
+            : 0.0;
+        final oldMaxExtent = _scrollController.hasClients
+            ? _scrollController.position.maxScrollExtent
+            : 0.0;
+
+        setState(() {
+          final prepend = <Message>[];
+          for (final msg in sorted) {
+            final key = _buildMessageKey(msg);
+            if (_messageKeys.add(key)) {
+              prepend.add(msg);
+            }
+          }
+          if (prepend.isNotEmpty) {
+            _messages = [...prepend, ..._messages];
+          }
+          _jumpWindowStartDate = targetDate;
+          _updateJumpRangeFlags();
+        });
+
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted || !_scrollController.hasClients) return;
+          try {
+            final newMaxExtent = _scrollController.position.maxScrollExtent;
+            final delta = newMaxExtent - oldMaxExtent;
+            final target = oldPixels + delta;
+            if (target >= 0 &&
+                target <= _scrollController.position.maxScrollExtent) {
+              _scrollController.jumpTo(target);
+            }
+          } catch (_) {}
+        });
+      }
+    } finally {
+      if (mounted && _selectedSession?.username == session.username) {
+        setState(() {
+          if (newer) {
+            _isLoadingJumpNewer = false;
+          } else {
+            _isLoadingJumpOlder = false;
+          }
+        });
+      }
+    }
+  }
+
+  Future<DateTime?> _showJumpDatePickerDialog() async {
+    final startDate = _availableStartDate ?? DateTime.now();
+    final endDate = _availableEndDate ?? DateTime.now();
+    DateTime selected =
+        _jumpTargetDate ?? (endDate.isAfter(startDate) ? endDate : startDate);
+    if (!_availableMessageDates.contains(_formatDateOnly(selected))) {
+      selected = endDate.isAfter(startDate) ? endDate : startDate;
+    }
+    DateTime currentMonth = DateTime(selected.year, selected.month);
+
+    return showDialog<DateTime>(
+      context: context,
+      barrierDismissible: true,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setLocalState) {
+            final earliestMonth =
+                DateTime(startDate.year, startDate.month, 1);
+            final latestMonth = DateTime(endDate.year, endDate.month, 1);
+            final monthLabel =
+                '${currentMonth.year}-${currentMonth.month.toString().padLeft(2, '0')}';
+            final daysInMonth = DateUtils.getDaysInMonth(
+              currentMonth.year,
+              currentMonth.month,
+            );
+            final firstWeekday =
+                DateTime(currentMonth.year, currentMonth.month, 1).weekday;
+            final leadingEmpty = (firstWeekday - 1) % 7;
+            final totalCells =
+                ((leadingEmpty + daysInMonth + 6) / 7).floor() * 7;
+            final canPrev = currentMonth.isAfter(earliestMonth);
+            final canNext = currentMonth.isBefore(latestMonth);
+
+            List<Widget> buildDayCells() {
+              final cells = <Widget>[];
+              for (int i = 0; i < totalCells; i++) {
+                final dayNumber = i - leadingEmpty + 1;
+                if (dayNumber <= 0 || dayNumber > daysInMonth) {
+                  cells.add(const SizedBox.shrink());
+                  continue;
+                }
+                final date = DateTime(
+                  currentMonth.year,
+                  currentMonth.month,
+                  dayNumber,
+                );
+                final key = _formatDateOnly(date);
+                final isAvailable = _availableMessageDates.contains(key);
+                final isSelected = _formatDateOnly(selected) == key;
+                final isToday = DateUtils.isSameDay(date, DateTime.now());
+
+                cells.add(
+                  InkWell(
+                    borderRadius: BorderRadius.circular(10),
+                    onTap: isAvailable
+                        ? () => setLocalState(() => selected = date)
+                        : null,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: isSelected
+                            ? Theme.of(context).colorScheme.primary
+                            : Colors.transparent,
+                        borderRadius: BorderRadius.circular(10),
+                        border: isToday && !isSelected
+                            ? Border.all(
+                                color: Theme.of(context)
+                                    .colorScheme
+                                    .primary
+                                    .withValues(alpha: 0.4),
+                              )
+                            : null,
+                      ),
+                      child: Center(
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Text(
+                              '$dayNumber',
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .bodySmall
+                                  ?.copyWith(
+                                    fontWeight: FontWeight.w600,
+                                    color: isAvailable
+                                        ? (isSelected
+                                            ? Colors.white
+                                            : Theme.of(context)
+                                                .colorScheme
+                                                .onSurface)
+                                        : Theme.of(context)
+                                            .colorScheme
+                                            .onSurface
+                                            .withValues(alpha: 0.3),
+                                  ),
+                            ),
+                            const SizedBox(height: 4),
+                            Container(
+                              width: 4,
+                              height: 4,
+                              decoration: BoxDecoration(
+                                color: isAvailable
+                                    ? (isSelected
+                                        ? Colors.white.withValues(alpha: 0.9)
+                                        : Theme.of(context)
+                                            .colorScheme
+                                            .primary
+                                            .withValues(alpha: 0.6))
+                                    : Colors.transparent,
+                                shape: BoxShape.circle,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              }
+              return cells;
+            }
+
+            return LayoutBuilder(
+              builder: (context, constraints) {
+                final dialogWidth = math.min(520.0, constraints.maxWidth - 40);
+                final dialogHeight = math.min(
+                  540.0,
+                  constraints.maxHeight - 40,
+                );
+                final cellSize =
+                    ((dialogWidth - 36) / 7).clamp(34.0, 54.0);
+                final aspectRatio = cellSize / (cellSize + 10);
+
+                return Dialog(
+                  insetPadding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 24,
+                  ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(18),
+                  ),
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(
+                      maxWidth: dialogWidth,
+                      maxHeight: dialogHeight,
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Row(
+                            children: [
+                              Text(
+                                '跳转到日期',
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .titleMedium
+                                    ?.copyWith(fontWeight: FontWeight.w700),
+                              ),
+                              const Spacer(),
+                              IconButton(
+                                onPressed: () =>
+                                    Navigator.of(dialogContext).pop(),
+                                icon: const Icon(Icons.close_rounded),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 6),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  _formatDateOnly(selected),
+                                  style: Theme.of(context)
+                                      .textTheme
+                                      .headlineSmall
+                                      ?.copyWith(fontWeight: FontWeight.w700),
+                                ),
+                              ),
+                              IconButton(
+                                onPressed: canPrev
+                                    ? () => setLocalState(() {
+                                          currentMonth = DateTime(
+                                            currentMonth.year,
+                                            currentMonth.month - 1,
+                                          );
+                                        })
+                                    : null,
+                                icon: const Icon(Icons.chevron_left_rounded),
+                              ),
+                              Text(
+                                monthLabel,
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .bodyMedium
+                                    ?.copyWith(fontWeight: FontWeight.w600),
+                              ),
+                              IconButton(
+                                onPressed: canNext
+                                    ? () => setLocalState(() {
+                                          currentMonth = DateTime(
+                                            currentMonth.year,
+                                            currentMonth.month + 1,
+                                          );
+                                        })
+                                    : null,
+                                icon: const Icon(Icons.chevron_right_rounded),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: const [
+                              Text('一'),
+                              Text('二'),
+                              Text('三'),
+                              Text('四'),
+                              Text('五'),
+                              Text('六'),
+                              Text('日'),
+                            ],
+                          ),
+                          const SizedBox(height: 6),
+                          Expanded(
+                            child: GridView.count(
+                              physics: const NeverScrollableScrollPhysics(),
+                              crossAxisCount: 7,
+                              mainAxisSpacing: 6,
+                              crossAxisSpacing: 6,
+                              childAspectRatio: aspectRatio,
+                              children: buildDayCells(),
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: OutlinedButton(
+                                  onPressed: () =>
+                                      Navigator.of(dialogContext).pop(),
+                                  child: const Text('取消'),
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: ElevatedButton(
+                                  onPressed: _availableMessageDates
+                                          .contains(_formatDateOnly(selected))
+                                      ? () => Navigator.of(dialogContext).pop(
+                                            selected,
+                                          )
+                                      : null,
+                                  child: const Text('跳转'),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              },
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _jumpToSelectedDate() async {
+    final session = _selectedSession;
+    final targetDate = _jumpTargetDate;
+    if (session == null) return;
+    if (targetDate == null) {
+      _toast.show(context, '请先选择要跳转的日期', success: false);
+      return;
+    }
+    if (_availableMessageDates.isNotEmpty &&
+        !_availableMessageDates.contains(_formatDateOnly(targetDate))) {
+      _toast.show(context, '该日期没有消息记录', success: false);
+      return;
+    }
+    if (_isJumpingToDate) return;
+    if (_isLoadingMessages) {
+      _toast.show(context, '消息正在加载，请稍后再试', success: false);
+      return;
+    }
+
+    setState(() {
+      _isJumpingToDate = true;
+    });
+
+    try {
+      await _loadJumpContextForDate(targetDate);
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isJumpingToDate = false;
+        });
+      }
+    }
   }
 
   Future<bool> _waitVoiceFileReady(
@@ -707,12 +1358,32 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
   }
 
   void _onScroll() {
-    if (!_scrollController.hasClients || !_hasMoreMessages) {
+    if (!_scrollController.hasClients) {
       return;
     }
 
     final position = _scrollController.position;
     final distanceToTop = position.pixels;
+    final distanceToBottom =
+        position.maxScrollExtent - position.pixels;
+
+    if (_isJumpContextMode) {
+      if (!_isLoadingJumpOlder &&
+          distanceToTop <= _loadTriggerDistance &&
+          position.userScrollDirection == ScrollDirection.forward) {
+        _loadJumpAdjacentDate(newer: false);
+      }
+      if (!_isLoadingJumpNewer &&
+          distanceToBottom <= _loadTriggerDistance &&
+          position.userScrollDirection == ScrollDirection.reverse) {
+        _loadJumpAdjacentDate(newer: true);
+      }
+      return;
+    }
+
+    if (!_hasMoreMessages) {
+      return;
+    }
 
     if (distanceToTop > _prefetchTriggerDistance) {
       _prefetchScheduled = false;
@@ -1003,6 +1674,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
       _messages = []; // 清空旧消息
       _lastInitialLoadTime = null; // 重置初次加载时间
       _prefetchScheduled = false;
+      _messageGlobalKeys.clear();
       _resetScrollController();
       _resetUtilityPanelState();
     });
@@ -1740,6 +2412,12 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
     if (base.endsWith('.dat') || base.endsWith('.jpg')) {
       base = base.substring(0, base.length - 4);
     }
+    for (final suffix in ['.b', '.h', '.t', '.c']) {
+      if (base.endsWith(suffix)) {
+        base = base.substring(0, base.length - suffix.length);
+        break;
+      }
+    }
     for (final suffix in ['_b', '_h', '_t', '_c']) {
       if (base.endsWith(suffix)) {
         base = base.substring(0, base.length - suffix.length);
@@ -1750,6 +2428,10 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
   }
 
   _ImageVariant _detectVariant(String base) {
+    if (base.endsWith('.b')) return _ImageVariant.big;
+    if (base.endsWith('.t')) return _ImageVariant.thumb;
+    if (base.endsWith('.h')) return _ImageVariant.high;
+    if (base.endsWith('.c')) return _ImageVariant.cache;
     if (base.endsWith('_b')) return _ImageVariant.big;
     if (base.endsWith('_t')) return _ImageVariant.thumb;
     if (base.endsWith('_h')) return _ImageVariant.high;
@@ -1812,9 +2494,11 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
     if (session == null) return;
     if (_sessionDetailInfo != null &&
         _sessionDetailForSession == session.username) {
+      _loadAvailableMessageDates();
       return;
     }
     _loadSessionDetailInfo(session: session);
+    _loadAvailableMessageDates();
   }
 
   Future<void> _loadSessionDetailInfo({
@@ -2308,9 +2992,9 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
             ),
             // 右侧消息 + 工具栏
             Expanded(
-              child: Row(
+              child: Stack(
                 children: [
-                  Expanded(
+                  Positioned.fill(
                     child: _selectedSession == null
                         ? const SizedBox.shrink()
                         : Column(
@@ -2501,30 +3185,43 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
                                                         appState,
                                                       );
 
-                                                  return MessageBubble(
-                                                    key: ValueKey(
-                                                      'msg-${message.localId}-${message.createTime}',
+                                                  final messageKey =
+                                                      _buildMessageKey(message);
+                                                  final contextKey =
+                                                      _messageGlobalKeys
+                                                          .putIfAbsent(
+                                                    messageKey,
+                                                    () => GlobalKey(),
+                                                  );
+
+                                                  return KeyedSubtree(
+                                                    key: contextKey,
+                                                    child: MessageBubble(
+                                                      key: ValueKey(
+                                                        'msg-${message.localId}-${message.createTime}',
+                                                      ),
+                                                      message: message,
+                                                      isFromMe:
+                                                          _isMessageFromMe(
+                                                        message,
+                                                      ),
+                                                      senderDisplayName:
+                                                          senderName,
+                                                      sessionUsername:
+                                                          _selectedSession
+                                                              ?.username ??
+                                                          '',
+                                                      shouldShowTime:
+                                                          shouldShowTime,
+                                                      avatarUrl:
+                                                          _isMessageFromMe(
+                                                            message,
+                                                          )
+                                                          ? _myAvatarUrl
+                                                          : avatarUrl,
+                                                      enableAvatarFade:
+                                                          animateAvatar,
                                                     ),
-                                                    message: message,
-                                                    isFromMe: _isMessageFromMe(
-                                                      message,
-                                                    ),
-                                                    senderDisplayName:
-                                                        senderName,
-                                                    sessionUsername:
-                                                        _selectedSession
-                                                            ?.username ??
-                                                        '',
-                                                    shouldShowTime:
-                                                        shouldShowTime,
-                                                    avatarUrl:
-                                                        _isMessageFromMe(
-                                                          message,
-                                                        )
-                                                        ? _myAvatarUrl
-                                                        : avatarUrl,
-                                                    enableAvatarFade:
-                                                        animateAvatar,
                                                   );
                                                 },
                                               ),
@@ -2536,31 +3233,34 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
                             ],
                           ),
                   ),
-                  AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 200),
-                    switchInCurve: Curves.easeOut,
-                    switchOutCurve: Curves.easeIn,
-                    transitionBuilder: (child, animation) {
-                      final slide = Tween<Offset>(
-                        begin: const Offset(0.1, 0),
-                        end: Offset.zero,
-                      ).animate(animation);
-                      return SizeTransition(
-                        sizeFactor: animation,
-                        axis: Axis.horizontal,
-                        axisAlignment: -1,
-                        child: SlideTransition(position: slide, child: child),
-                      );
-                    },
-                    child: (_selectedSession != null && _showUtilityPanel)
-                        ? SizedBox(
-                            key: const ValueKey('utility-panel'),
-                            width: 320,
-                            child: _buildUtilityPanel(context),
-                          )
-                        : const SizedBox.shrink(
-                            key: ValueKey('utility-panel-empty'),
-                          ),
+                  Positioned(
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                    child: AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 220),
+                      switchInCurve: Curves.easeOut,
+                      switchOutCurve: Curves.easeIn,
+                      transitionBuilder: (child, animation) {
+                        final slide = Tween<Offset>(
+                          begin: const Offset(0.08, 0),
+                          end: Offset.zero,
+                        ).animate(animation);
+                        return FadeTransition(
+                          opacity: animation,
+                          child: SlideTransition(position: slide, child: child),
+                        );
+                      },
+                      child: (_selectedSession != null && _showUtilityPanel)
+                          ? SizedBox(
+                              key: const ValueKey('utility-panel'),
+                              width: 320,
+                              child: _buildUtilityPanel(context),
+                            )
+                          : const SizedBox.shrink(
+                              key: ValueKey('utility-panel-empty'),
+                            ),
+                    ),
                   ),
                 ],
               ),
@@ -2859,62 +3559,201 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _buildDetailRow(theme, '显示名称', detail.displayName),
-        _buildDetailRow(theme, '微信ID', detail.wxid),
-        if (detail.remark != null) _buildDetailRow(theme, '备注', detail.remark!),
-        if (detail.nickName != null)
-          _buildDetailRow(theme, '昵称', detail.nickName!),
-        if (detail.alias != null) _buildDetailRow(theme, '微信号', detail.alias!),
-        const SizedBox(height: 6),
-        _buildDetailRow(theme, '消息总数', '${detail.messageCount} 条'),
-        _buildDetailRow(
+        _buildDetailSection(
           theme,
-          '第一条消息',
-          _formatDetailTime(detail.firstMessageTime),
-        ),
-        _buildDetailRow(
-          theme,
-          '最新消息',
-          _formatDetailTime(detail.latestMessageTime),
-        ),
-        const SizedBox(height: 10),
-        Text(
-          '消息表分布',
-          style: theme.textTheme.bodyMedium?.copyWith(
-            fontWeight: FontWeight.w700,
+          title: '会话信息',
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _buildDetailRow(theme, '显示名称', detail.displayName),
+              _buildDetailRow(theme, '微信ID', detail.wxid),
+              if (detail.remark != null)
+                _buildDetailRow(theme, '备注', detail.remark!),
+              if (detail.nickName != null)
+                _buildDetailRow(theme, '昵称', detail.nickName!),
+              if (detail.alias != null)
+                _buildDetailRow(theme, '微信号', detail.alias!),
+            ],
           ),
         ),
-        const SizedBox(height: 6),
-        if (detail.messageTables.isEmpty)
+        _buildDetailSection(
+          theme,
+          title: '消息概况',
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _buildDetailRow(theme, '消息总数', '${detail.messageCount} 条'),
+              _buildDetailRow(
+                theme,
+                '第一条消息',
+                _formatDetailTime(detail.firstMessageTime),
+              ),
+              _buildDetailRow(
+                theme,
+                '最新消息',
+                _formatDetailTime(detail.latestMessageTime),
+              ),
+              const SizedBox(height: 12),
+              _buildJumpToDateControls(theme),
+            ],
+          ),
+        ),
+        _buildDetailSection(
+          theme,
+          title: '消息表分布',
+          child: detail.messageTables.isEmpty
+              ? Text(
+                  '未找到消息表',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurface.withValues(alpha: 0.6),
+                  ),
+                )
+              : Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: detail.messageTables
+                      .map(
+                        (table) => Padding(
+                          padding: const EdgeInsets.only(bottom: 8),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                table.databaseName,
+                                style: theme.textTheme.bodyMedium?.copyWith(
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                              Text(
+                                '${table.tableName} · ${table.messageCount} 条',
+                                style: theme.textTheme.bodySmall?.copyWith(
+                                  color: theme.colorScheme.onSurface
+                                      .withValues(alpha: 0.6),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      )
+                      .toList(),
+                ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildDetailSection(
+    ThemeData theme, {
+    required String title,
+    required Widget child,
+  }) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.35),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: theme.colorScheme.outline.withValues(alpha: 0.12),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
           Text(
-            '未找到消息表',
-            style: theme.textTheme.bodySmall?.copyWith(
-              color: theme.colorScheme.onSurface.withValues(alpha: 0.6),
+            title,
+            style: theme.textTheme.bodyMedium?.copyWith(
+              fontWeight: FontWeight.w700,
             ),
-          )
-        else
-          ...detail.messageTables.map(
-            (table) => Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    table.databaseName,
-                    style: theme.textTheme.bodyMedium?.copyWith(
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                  Text(
-                    '${table.tableName} · ${table.messageCount} 条',
-                    style: theme.textTheme.bodySmall?.copyWith(
-                      color: theme.colorScheme.onSurface.withValues(alpha: 0.6),
-                    ),
-                  ),
-                ],
+          ),
+          const SizedBox(height: 8),
+          child,
+        ],
+      ),
+    );
+  }
+
+  Widget _buildJumpToDateControls(ThemeData theme) {
+    final dateLabel = _jumpTargetDate == null
+        ? '选择日期'
+        : _formatDateOnly(_jumpTargetDate!);
+    final loadingHint = _isLoadingMessageDates ? '正在索引日期...' : null;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          '跳转到指定日期',
+          style: theme.textTheme.bodySmall?.copyWith(
+            fontWeight: FontWeight.w600,
+            color: theme.colorScheme.onSurface.withValues(alpha: 0.7),
+          ),
+        ),
+        const SizedBox(height: 8),
+        InkWell(
+          onTap: _isLoadingMessageDates ? null : _pickJumpDate,
+          borderRadius: BorderRadius.circular(10),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surface,
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(
+                color: theme.colorScheme.outline.withValues(alpha: 0.12),
               ),
             ),
+            child: Row(
+              children: [
+                Icon(
+                  Icons.event_rounded,
+                  size: 16,
+                  color: theme.colorScheme.onSurface.withValues(alpha: 0.6),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    loadingHint ?? dateLabel,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      fontWeight: FontWeight.w600,
+                      color: _isLoadingMessageDates
+                          ? theme.colorScheme.onSurface.withValues(alpha: 0.5)
+                          : _jumpTargetDate == null
+                          ? theme.colorScheme.onSurface.withValues(alpha: 0.5)
+                          : theme.colorScheme.onSurface,
+                    ),
+                  ),
+                ),
+                Icon(
+                  Icons.chevron_right_rounded,
+                  size: 18,
+                  color: theme.colorScheme.onSurface.withValues(alpha: 0.4),
+                ),
+              ],
+            ),
           ),
+        ),
+        const SizedBox(height: 8),
+        SizedBox(
+          width: double.infinity,
+          child: FilledButton.tonal(
+            onPressed: (_isJumpingToDate || _isLoadingMessageDates)
+                ? null
+                : _jumpToSelectedDate,
+            child: _isJumpingToDate
+                ? Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                      const SizedBox(width: 8),
+                      const Text('定位中...'),
+                    ],
+                  )
+                : const Text('跳转到该日'),
+          ),
+        ),
       ],
     );
   }

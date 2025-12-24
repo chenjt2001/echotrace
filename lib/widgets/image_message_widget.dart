@@ -412,6 +412,12 @@ class _ImageMessageWidgetState extends State<ImageMessageWidget> {
     if (base.endsWith('.dat') || base.endsWith('.jpg')) {
       base = base.substring(0, base.length - 4);
     }
+    for (final suffix in ['.b', '.h', '.t', '.c']) {
+      if (base.endsWith(suffix)) {
+        base = base.substring(0, base.length - suffix.length);
+        break;
+      }
+    }
     for (final suffix in ['_b', '_h', '_t', '_c']) {
       if (base.endsWith(suffix)) {
         base = base.substring(0, base.length - suffix.length);
@@ -422,6 +428,10 @@ class _ImageMessageWidgetState extends State<ImageMessageWidget> {
   }
 
   _ImageVariant _detectVariant(String base) {
+    if (base.endsWith('.b')) return _ImageVariant.big;
+    if (base.endsWith('.t')) return _ImageVariant.thumb;
+    if (base.endsWith('.h')) return _ImageVariant.high;
+    if (base.endsWith('.c')) return _ImageVariant.cache;
     if (base.endsWith('_b')) return _ImageVariant.big;
     if (base.endsWith('_t')) return _ImageVariant.thumb;
     if (base.endsWith('_h')) return _ImageVariant.high;

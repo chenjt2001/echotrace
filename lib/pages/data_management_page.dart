@@ -1,9 +1,11 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math' as math;
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:path_provider/path_provider.dart';
-import 'dart:io';
-import 'dart:typed_data';
-import 'dart:convert';
 import 'package:crypto/crypto.dart';
 import '../providers/app_state.dart';
 import '../services/config_service.dart';
@@ -11,6 +13,32 @@ import '../services/decrypt_service.dart';
 import '../services/image_decrypt_service.dart';
 import '../services/logger_service.dart';
 import '../services/go_decrypt_ffi.dart';
+import '../utils/cpu_info.dart';
+
+class _AsyncSemaphore {
+  _AsyncSemaphore(this._permits) : assert(_permits > 0);
+
+  int _permits;
+  final List<Completer<void>> _waiters = [];
+
+  Future<void> acquire() {
+    if (_permits > 0) {
+      _permits -= 1;
+      return Future.value();
+    }
+    final completer = Completer<void>();
+    _waiters.add(completer);
+    return completer.future;
+  }
+
+  void release() {
+    if (_waiters.isNotEmpty) {
+      _waiters.removeAt(0).complete();
+      return;
+    }
+    _permits += 1;
+  }
+}
 
 /// 数据管理页面
 class DataManagementPage extends StatefulWidget {
@@ -59,8 +87,13 @@ class _DataManagementPageState extends State<DataManagementPage> {
   String? _imageStatusMessage;
   bool _isImageSuccess = false;
   bool _showOnlyUndecrypted = false; // 只显示未解密的文件
-  int _displayLimit = 1000; // 默认显示前1000条
+  static const int _initialImageDisplayLimit = 1000;
+  static const int _imagePageSize = 1000;
+  int _displayLimit = _initialImageDisplayLimit; // 默认显示前1000条
   String _imageQualityFilter = 'all'; // 'all', 'original', 'thumbnail' - 图片质量过滤
+  int _lastImageFilteredCount = 0;
+  bool _isLoadingMoreImages = false;
+  final ScrollController _imageListController = ScrollController();
 
   // 图片解密进度相关
   bool _isDecryptingImages = false;
@@ -78,6 +111,7 @@ class _DataManagementPageState extends State<DataManagementPage> {
     _decryptService = DecryptService();
     _decryptService.initialize();
     _imageDecryptService = ImageDecryptService();
+    _imageListController.addListener(_handleImageListScroll);
     _loadDatabaseFiles();
     _loadImageFiles();
   }
@@ -90,7 +124,33 @@ class _DataManagementPageState extends State<DataManagementPage> {
     _progressNotifiers.clear();
     _decryptService.dispose();
     _imageSearchController.dispose();
+    _imageListController.dispose();
     super.dispose();
+  }
+
+  void _handleImageListScroll() {
+    if (!_imageListController.hasClients) return;
+    final position = _imageListController.position;
+    if (position.extentAfter > 600) return;
+    if (_displayLimit >= _lastImageFilteredCount) return;
+    if (_isLoadingMoreImages) return;
+    _isLoadingMoreImages = true;
+    setState(() {
+      _displayLimit = math.min(
+        _displayLimit + _imagePageSize,
+        _lastImageFilteredCount,
+      );
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _isLoadingMoreImages = false;
+    });
+  }
+
+  void _resetImageListLimit() {
+    _displayLimit = _initialImageDisplayLimit;
+    if (_imageListController.hasClients) {
+      _imageListController.jumpTo(0);
+    }
   }
 
   /// 加载数据库文件列表
@@ -1235,7 +1295,7 @@ class _DataManagementPageState extends State<DataManagementPage> {
     setState(() {
       _isLoadingImages = true;
       _imageFiles.clear(); // 清空列表在setState中，确保UI立即更新
-      _displayLimit = 1000; // 重置显示限制
+      _displayLimit = _initialImageDisplayLimit; // 重置显示限制
       _showOnlyUndecrypted = false; // 重置过滤
       _imageQualityFilter = 'all'; // 重置质量过滤
     });
@@ -1374,6 +1434,16 @@ class _DataManagementPageState extends State<DataManagementPage> {
 
     final rebuilt = parts.join(sep);
     return hasLeadingSep ? '$sep$rebuilt' : rebuilt;
+  }
+
+  String _buildImageDecryptedPath(String documentsPath, ImageFile imageFile) {
+    final outputRelativePath = _applyDisplayNameToRelativePath(
+      imageFile.relativePath,
+    );
+    final outputDir = Directory(
+      '$documentsPath${Platform.pathSeparator}EchoTrace${Platform.pathSeparator}Images',
+    );
+    return '${outputDir.path}$outputRelativePath'.replaceAll('.dat', '.jpg');
   }
 
   Future<void> _scanImagePath(
@@ -1570,7 +1640,7 @@ class _DataManagementPageState extends State<DataManagementPage> {
             // 检测图片质量类型
             final imageQuality = _detectImageQuality(relativePath, fileSize);
 
-            // 计算解密后的路径（不检查是否存在，加快扫描速度）
+            // 计算解密后的路径并检查是否已解密
             final outputDir = Directory(
               '$documentsPath${Platform.pathSeparator}EchoTrace${Platform.pathSeparator}Images',
             );
@@ -1578,6 +1648,7 @@ class _DataManagementPageState extends State<DataManagementPage> {
               '.dat',
               '.jpg',
             );
+            final decryptedExists = await File(decryptedPath).exists();
 
             // 快速扫描：不检测版本和解密状态（解密时再检测）
             _imageFiles.add(
@@ -1586,7 +1657,7 @@ class _DataManagementPageState extends State<DataManagementPage> {
                 fileName: fileName,
                 fileSize: fileSize,
                 relativePath: outputRelativePath,
-                isDecrypted: false, // 默认未解密，批量解密时会自动跳过已存在的
+                isDecrypted: decryptedExists,
                 decryptedPath: decryptedPath,
                 version: 0, // 默认V3，解密时自动检测
                 imageQuality: imageQuality,
@@ -1624,6 +1695,14 @@ class _DataManagementPageState extends State<DataManagementPage> {
 
   /// 批量解密图片
   Future<void> _decryptAllImages() async {
+    if (!mounted) return;
+    setState(() {
+      _isDecryptingImages = true;
+      _currentDecryptingImage = '初始化解密线程…';
+      _totalImageFiles = 0;
+      _completedImageFiles = 0;
+    });
+
     // 应用当前筛选条件获取需要解密的图片列表
     List<ImageFile> filteredFiles = _imageFiles;
 
@@ -1650,6 +1729,12 @@ class _DataManagementPageState extends State<DataManagementPage> {
 
     if (filteredFiles.isEmpty) {
       _showImageMessage('当前筛选条件下没有需要解密的图片文件', false);
+      if (mounted) {
+        setState(() {
+          _isDecryptingImages = false;
+          _currentDecryptingImage = '';
+        });
+      }
       return;
     }
 
@@ -1659,125 +1744,17 @@ class _DataManagementPageState extends State<DataManagementPage> {
 
     if (xorKeyHex == null || xorKeyHex.isEmpty) {
       _showImageMessage('未配置图片解密密钥，请在设置中配置 XOR 和 AES 密钥', false);
-      return;
-    }
-
-    setState(() {
-      _isDecryptingImages = true;
-      _totalImageFiles = filteredFiles.length; // 初始化为筛选后的总数
-      _completedImageFiles = 0;
-      _imageDecryptResults.clear();
-    });
-
-    try {
-      final xorKey = ImageDecryptService.hexToXorKey(xorKeyHex);
-      Uint8List? aesKey;
-
-      if (aesKeyHex != null && aesKeyHex.isNotEmpty && aesKeyHex.length >= 16) {
-        aesKey = ImageDecryptService.hexToBytes16(aesKeyHex);
-      }
-
-      int successCount = 0;
-      int failCount = 0;
-
-      // 第一次遍历：标记已存在的文件并计算需要解密的数量
-      int needDecryptCount = 0;
-      for (final imageFile in filteredFiles) {
-        final outputFile = File(imageFile.decryptedPath);
-        if (await outputFile.exists()) {
-          imageFile.isDecrypted = true;
-        } else {
-          needDecryptCount++;
-        }
-      }
-
-      // 更新总数
-      setState(() {
-        _totalImageFiles = needDecryptCount;
-      });
-
-      // 第二次遍历：只解密需要解密的文件（仅处理筛选后的文件）
-      for (final imageFile in filteredFiles) {
-        if (imageFile.isDecrypted) {
-          continue; // 跳过已存在的文件
-        }
-
-        _currentDecryptingImage = imageFile.fileName;
-
-        try {
-          // 创建输出目录
-          final outputFile = File(imageFile.decryptedPath);
-          final outputDir = outputFile.parent;
-          if (!await outputDir.exists()) {
-            await outputDir.create(recursive: true);
-          }
-
-          // 解密（使用异步方法确保数据完整性）
-          await _imageDecryptService.decryptDatAutoAsync(
-            imageFile.originalPath,
-            imageFile.decryptedPath,
-            xorKey,
-            aesKey,
-          );
-
-          imageFile.isDecrypted = true;
-          _imageDecryptResults[imageFile.fileName] = true;
-          successCount++;
-
-          await logger.info(
-            'DataManagementPage',
-            '图片解密成功: ${imageFile.fileName}',
-          );
-        } catch (e) {
-          _imageDecryptResults[imageFile.fileName] = false;
-          failCount++;
-          await logger.error(
-            'DataManagementPage',
-            '图片解密失败: ${imageFile.fileName}',
-            e,
-          );
-        }
-
-        _completedImageFiles++;
-        final progress = _totalImageFiles > 0
-            ? _completedImageFiles / _totalImageFiles
-            : 0.0;
-        if (_shouldUpdateProgress('images', progress) && mounted) {
-          setState(() {});
-        }
-      }
-
-      _showImageMessage(
-        '图片解密完成！成功: $successCount, 失败: $failCount',
-        failCount == 0,
-      );
-    } catch (e, stackTrace) {
-      await logger.error('DataManagementPage', '批量解密图片失败', e, stackTrace);
-      _showImageMessage('批量解密失败: $e', false);
-    } finally {
       if (mounted) {
         setState(() {
           _isDecryptingImages = false;
           _currentDecryptingImage = '';
         });
       }
-      _lastProgressUpdateMap.remove('images');
-      _lastProgressValueMap.remove('images');
-    }
-  }
-
-  /// 解密单个图片
-  Future<void> _decryptSingleImage(ImageFile imageFile) async {
-    // 检查密钥配置
-    final xorKeyHex = await _configService.getImageXorKey();
-    final aesKeyHex = await _configService.getImageAesKey();
-
-    if (xorKeyHex == null || xorKeyHex.isEmpty) {
-      _showImageMessage('未配置图片解密密钥', false);
       return;
     }
 
     try {
+      await _prepareDisplayNameCache();
       final xorKey = ImageDecryptService.hexToXorKey(xorKeyHex);
       Uint8List? aesKey;
 
@@ -1785,8 +1762,209 @@ class _DataManagementPageState extends State<DataManagementPage> {
         aesKey = ImageDecryptService.hexToBytes16(aesKeyHex);
       }
 
+      // 第一次遍历：标记已存在的文件并收集待解密文件
+      final pendingFiles = <ImageFile>[];
+      final documentsPath =
+          (await getApplicationDocumentsDirectory()).path;
+      for (final imageFile in filteredFiles) {
+        final outputPath = _buildImageDecryptedPath(
+          documentsPath,
+          imageFile,
+        );
+        final outputFile = File(outputPath);
+        if (await outputFile.exists()) {
+          imageFile.isDecrypted = true;
+          continue;
+        }
+        pendingFiles.add(imageFile);
+      }
+
+      if (pendingFiles.isEmpty) {
+        _showImageMessage('当前筛选条件下的图片均已解密', true);
+        if (mounted) {
+          setState(() {
+            _isDecryptingImages = false;
+            _currentDecryptingImage = '';
+          });
+        }
+        return;
+      }
+
+      final appState = context.read<AppState>();
+      final cpu = CpuInfo.logicalProcessors;
+      final concurrency = math.max(2, math.min(8, cpu));
+      final wxid = await _configService.getManualWxid();
+      final token = appState.tryStartBulkJob(
+        sessionUsername:
+            (wxid != null && wxid.isNotEmpty) ? wxid : 'data_management',
+        typeLabel: '图片批量解密',
+        poolSize: concurrency,
+      );
+      if (token == null) {
+        _showImageMessage('已有批量任务进行中，请等待完成', false);
+        if (mounted) {
+          setState(() {
+            _isDecryptingImages = false;
+            _currentDecryptingImage = '';
+          });
+        }
+        return;
+      }
+
+      setState(() {
+        _totalImageFiles = pendingFiles.length;
+        _completedImageFiles = 0;
+        _imageDecryptResults.clear();
+        _currentDecryptingImage = '准备解密…';
+      });
+
+      Timer? uiTimer;
+      var done = 0;
+      var successCount = 0;
+      var failCount = 0;
+      String? lastFile;
+
+      try {
+        final pool = await token.poolFuture;
+        _imageDecryptService.bulkPool = pool;
+
+        uiTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
+          if (!mounted) return;
+          setState(() {
+            _completedImageFiles = done;
+            final name = lastFile;
+            _currentDecryptingImage = name == null
+                ? '解密中（并行 $concurrency/$cpu）'
+                : '$name（并行 $concurrency/$cpu）';
+          });
+        });
+
+        final sem = _AsyncSemaphore(concurrency);
+        final futures = <Future<void>>[];
+        for (final imageFile in pendingFiles) {
+          await sem.acquire();
+          futures.add(() async {
+            lastFile = imageFile.fileName;
+            try {
+              final outputPath = _buildImageDecryptedPath(
+                documentsPath,
+                imageFile,
+              );
+              final outputFile = File(outputPath);
+              final outputDir = outputFile.parent;
+              if (!await outputDir.exists()) {
+                await outputDir.create(recursive: true);
+              }
+
+              await _imageDecryptService.decryptDatAutoAsync(
+                imageFile.originalPath,
+                outputPath,
+                xorKey,
+                aesKey,
+              );
+
+              imageFile.isDecrypted = true;
+              _imageDecryptResults[imageFile.fileName] = true;
+              successCount++;
+
+              await logger.info(
+                'DataManagementPage',
+                '图片解密成功: ${imageFile.fileName}',
+              );
+            } catch (e) {
+              _imageDecryptResults[imageFile.fileName] = false;
+              failCount++;
+              await logger.error(
+                'DataManagementPage',
+                '图片解密失败: ${imageFile.fileName}',
+                e,
+              );
+            } finally {
+              done += 1;
+              sem.release();
+            }
+          }());
+        }
+        await Future.wait(futures);
+
+        if (mounted) {
+          setState(() {
+            _completedImageFiles = done;
+          });
+        }
+
+        _showImageMessage(
+          '图片解密完成！成功: $successCount, 失败: $failCount',
+          failCount == 0,
+        );
+      } catch (e, stackTrace) {
+        await logger.error('DataManagementPage', '批量解密图片失败', e, stackTrace);
+        _showImageMessage('批量解密失败: $e', false);
+      } finally {
+        uiTimer?.cancel();
+        _imageDecryptService.bulkPool = null;
+        await appState.endBulkJob(token);
+        if (mounted) {
+          setState(() {
+            _isDecryptingImages = false;
+            _currentDecryptingImage = '';
+            if (_totalImageFiles > 0) {
+              _completedImageFiles =
+                  math.min(_completedImageFiles, _totalImageFiles);
+            }
+          });
+        }
+        _lastProgressUpdateMap.remove('images');
+        _lastProgressValueMap.remove('images');
+      }
+    } catch (e, stackTrace) {
+      await logger.error('DataManagementPage', '批量解密图片失败', e, stackTrace);
+      _showImageMessage('批量解密失败: $e', false);
+    }
+  }
+
+  /// 解密单个图片
+  Future<void> _decryptSingleImage(ImageFile imageFile) async {
+    if (!mounted) return;
+    setState(() {
+      _isDecryptingImages = true;
+      _currentDecryptingImage = imageFile.fileName;
+      _totalImageFiles = 1;
+      _completedImageFiles = 0;
+    });
+
+    // 检查密钥配置
+    final xorKeyHex = await _configService.getImageXorKey();
+    final aesKeyHex = await _configService.getImageAesKey();
+
+    if (xorKeyHex == null || xorKeyHex.isEmpty) {
+      _showImageMessage('未配置图片解密密钥', false);
+      if (mounted) {
+        setState(() {
+          _isDecryptingImages = false;
+          _currentDecryptingImage = '';
+        });
+      }
+      return;
+    }
+
+    try {
+      await _prepareDisplayNameCache();
+      final xorKey = ImageDecryptService.hexToXorKey(xorKeyHex);
+      Uint8List? aesKey;
+
+      if (aesKeyHex != null && aesKeyHex.isNotEmpty && aesKeyHex.length >= 16) {
+        aesKey = ImageDecryptService.hexToBytes16(aesKeyHex);
+      }
+
+      final documentsPath = (await getApplicationDocumentsDirectory()).path;
+      final outputPath = _buildImageDecryptedPath(
+        documentsPath,
+        imageFile,
+      );
+
       // 创建输出目录
-      final outputFile = File(imageFile.decryptedPath);
+      final outputFile = File(outputPath);
       final outputDir = outputFile.parent;
       if (!await outputDir.exists()) {
         await outputDir.create(recursive: true);
@@ -1795,13 +1973,14 @@ class _DataManagementPageState extends State<DataManagementPage> {
       // 解密（使用异步方法确保数据完整性）
       await _imageDecryptService.decryptDatAutoAsync(
         imageFile.originalPath,
-        imageFile.decryptedPath,
+        outputPath,
         xorKey,
         aesKey,
       );
 
       setState(() {
         imageFile.isDecrypted = true;
+        _completedImageFiles = 1;
       });
 
       _showImageMessage('解密成功: ${imageFile.fileName}', true);
@@ -1814,6 +1993,13 @@ class _DataManagementPageState extends State<DataManagementPage> {
         stackTrace,
       );
       _showImageMessage('解密失败: $e', false);
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isDecryptingImages = false;
+          _currentDecryptingImage = '';
+        });
+      }
     }
   }
 
@@ -2947,8 +3133,8 @@ class _DataManagementPageState extends State<DataManagementPage> {
     }
 
     // 应用显示限制
+    _lastImageFilteredCount = filteredFiles.length;
     final displayFiles = filteredFiles.take(_displayLimit).toList();
-    final hasMore = filteredFiles.length > _displayLimit;
 
     return Column(
       children: [
@@ -2976,6 +3162,7 @@ class _DataManagementPageState extends State<DataManagementPage> {
                             onChanged: (value) {
                               setState(() {
                                 _showOnlyUndecrypted = value;
+                                _resetImageListLimit();
                               });
                             },
                             activeColor: _primaryColor,
@@ -3047,6 +3234,7 @@ class _DataManagementPageState extends State<DataManagementPage> {
                           onTap: () {
                             setState(() {
                               _imageQualityFilter = quality;
+                              _resetImageListLimit();
                             });
                           },
                           borderRadius: BorderRadius.circular(8),
@@ -3104,6 +3292,7 @@ class _DataManagementPageState extends State<DataManagementPage> {
                                   setState(() {
                                     _imageNameQuery = '';
                                     _imageSearchController.clear();
+                                    _resetImageListLimit();
                                   });
                                 },
                               )
@@ -3129,6 +3318,7 @@ class _DataManagementPageState extends State<DataManagementPage> {
                       onChanged: (value) {
                         setState(() {
                           _imageNameQuery = value;
+                          _resetImageListLimit();
                         });
                       },
                     ),
@@ -3138,64 +3328,6 @@ class _DataManagementPageState extends State<DataManagementPage> {
             ],
           ),
         ),
-
-        // 加载更多提示
-        if (hasMore)
-          Container(
-            margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: _surfaceColor,
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: _borderColor),
-            ),
-            child: Row(
-              children: [
-                Icon(
-                  Icons.info_outline,
-                  size: 20,
-                  color: _primaryColor,
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Text(
-                    '显示前 $_displayLimit 条，共 ${filteredFiles.length} 条',
-                    style: TextStyle(
-                      fontSize: 13,
-                      color: Colors.grey.shade600,
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
-                ),
-                Material(
-                  color: _primaryColor,
-                  borderRadius: BorderRadius.circular(8),
-                  child: InkWell(
-                    onTap: () {
-                      setState(() {
-                        _displayLimit += 1000;
-                      });
-                    },
-                    borderRadius: BorderRadius.circular(8),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 8,
-                      ),
-                      child: const Text(
-                        '加载更多',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.w600,
-                          fontSize: 13,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
 
         // 文件列表
         Expanded(
@@ -3244,6 +3376,7 @@ class _DataManagementPageState extends State<DataManagementPage> {
                   ),
                 )
               : ListView.builder(
+                  controller: _imageListController,
                   padding: const EdgeInsets.symmetric(
                     horizontal: 16,
                     vertical: 8,
